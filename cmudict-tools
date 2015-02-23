@@ -24,10 +24,11 @@ from __future__ import print_function
 import cmudict
 import sys
 import argparse
+import csv
 
 class HelpWarningsAction(argparse.Action):
-	def __init__(self, option_strings, dest):
-		super(HelpWarningsAction, self).__init__(option_strings=option_strings, dest=dest, nargs=0)
+	def __init__(self, option_strings, dest, help=None):
+		super(HelpWarningsAction, self).__init__(option_strings=option_strings, dest=dest, nargs=0, help=help)
 
 	def __call__(self, parser, namespace, values, option_string=None):
 		print('The following values are available for -W:')
@@ -55,44 +56,47 @@ class HelpWarningsAction(argparse.Action):
 		sys.exit(0)
 
 def parse(args):
-	parser = cmudict.parse(args.filename, warnings=args.warnings, order_from=args.order_from, accent=args.source_accent, encoding=args.input_encoding)
+	parser = cmudict.parse(args.filename, warnings=args.warnings, order_from=args.order_from, accent=args.source_accent, phoneset=args.source_phoneset, encoding=args.input_encoding)
 	if args.sort:
 		return cmudict.sort(parser, args.sort)
 	return parser
 
 def print_dict(args):
-	cmudict.format(args.format, parse(args), accent=args.accent, encoding=args.output_encoding)
-
-def debug(args):
-	for entry in parse(args):
-		print(entry)
+	cmudict.format(args.format, parse(args), accent=args.accent, phoneset=args.phoneset, encoding=args.output_encoding)
 
 def validate(args):
-	for word, context, phonemes, comment, error in parse(args):
+	for word, context, phonemes, comment, metadata, error in parse(args):
 		if error:
 			print(error, file=sys.stderr)
 
 commands = {
-	'debug':    debug,
 	'validate': validate,
 	'print':    print_dict,
 }
 
+formats = list(cmudict.dict_formats.keys())
+formats.extend(['json'])
+
 parser = argparse.ArgumentParser(description='A helper program for working with the CMU Pronunciation Dictionary.')
-parser.add_argument('-W', dest='warnings', action='append', default=[])
-parser.add_argument('--source-accent', default=None, choices=cmudict.accents.keys())
-parser.add_argument('--accent', default=None, choices=cmudict.accents.keys())
-parser.add_argument('--format', default='cmudict', choices=cmudict.dict_formats.keys())
-parser.add_argument('--sort', default=None, choices=['weide', 'air'])
-parser.add_argument('--order-from', default=0, type=int)
-parser.add_argument('--help-warnings', action=HelpWarningsAction)
-parser.add_argument('--input-encoding', default='windows-1252')
-parser.add_argument('--output-encoding', default='windows-1252')
-parser.add_argument('command', choices=commands.keys())
-parser.add_argument('filename')
+parser.add_argument('-W', dest='warnings', action='append', metavar='WARNING', default=[], help='Configure the validation checks to perform.')
+parser.add_argument('--source-accent', default=None, help='The accent to process the dictionary pronunciation in.')
+parser.add_argument('--source-phoneset', default=None, help='The phoneset used by the dictionary pronunciations.')
+parser.add_argument('--accent', default=None, help='The accent to print the pronunciations in.')
+parser.add_argument('--phoneset', default=None, help='The phoneset used to print the pronunciations.')
+parser.add_argument('--format', default='cmudict', choices=formats, help='The format to output the dictionary in.')
+parser.add_argument('--sort', default='none', choices=['air', 'none', 'weide'], help='How the entries are sorted in the output.')
+parser.add_argument('--order-from', default=0, type=int, help='The number to start variants at.')
+parser.add_argument('--help-warnings', action=HelpWarningsAction, help='List the available validation warnings.')
+parser.add_argument('--input-encoding', default='windows-1252', help='The encoding of the dictionary file.')
+parser.add_argument('--output-encoding', default='windows-1252', help='The encoding to print the entries in.')
+parser.add_argument('command', choices=commands.keys(), help='The action to perform.')
+parser.add_argument('filename', help='The dictionary file to perform the action on.')
 args = parser.parse_args()
+
+if args.sort == 'none':
+	args.sort = None
 
 try:
 	commands[args.command](args)
-except ValueError as e:
+except cmudict.InvalidWarning as e:
 	print(e)

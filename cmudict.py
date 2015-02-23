@@ -25,53 +25,31 @@ from __future__ import print_function
 import os
 import sys
 import re
-import csv
+import json
 import codecs
+
+import metadata
 
 root = os.path.dirname(os.path.realpath(__file__))
 
 if sys.version_info[0] == 2:
 	ustr = unicode
 
-	def to_utf8(x):
-		return x.encode('utf-8')
-
-	def read_csv(filename):
-		with open(filename, 'rb') as f:
-			for entry in csv.reader(f):
-				yield [x.decode('utf-8') for x in entry]
-
 	def printf(fmt, encoding, *args):
 		output = unicode(fmt).format(*args)
-		print(output.encode(encoding))
+		sys.stdout.write(output.encode(encoding))
 else:
 	ustr = str
-
-	def to_utf8(x):
-		return x
-
-	def read_csv(filename):
-		with open(filename, 'rb') as f:
-			for entry in csv.reader(codecs.iterdecode(f, 'utf-8')):
-				yield entry
 
 	def printf(fmt, encoding, *args):
 		output = fmt.format(*args)
 		sys.stdout.buffer.write(output.encode(encoding))
-		sys.stdout.buffer.write(b'\n')
 
 def read_phonetable(filename):
 	columns = None
-	for entry in read_csv(filename):
-		entry = [ None if x == '' else x for x in entry ]
-		if entry[0] == None:
-			pass # Comment only line
-		elif columns:
-			data = dict(zip(columns, entry))
-			data['Accents'] = data['Accents'].split(';')
-			yield data
-		else:
-			columns = entry
+	for data in metadata.parse_csv(filename):
+		data['Phone Sets'] = data['Phone Sets'].split(';')
+		yield data
 
 def festlex_context(context):
 	if not context in ['dt', 'j', 'n', 'nil', 'v', 'v_p', 'vl', 'y']:
@@ -87,14 +65,14 @@ class IpaPhonemeSet:
 		if not data[self.accent]:
 			return # not supported in this accent
 		arpabet = data['Arpabet']
-		ipa = to_utf8(data[self.accent])
+		ipa = data[self.accent]
 		if data['Type'] == 'consonant':
 			self.to_ipa[arpabet] = ipa
 		elif data['Type'] == 'vowel':
 			self.to_ipa[arpabet] = ipa # missing stress
 			self.to_ipa['{0}0'.format(arpabet)] = ipa
-			self.to_ipa['{0}1'.format(arpabet)] = 'ˈ{0}'.format(ipa)
-			self.to_ipa['{0}2'.format(arpabet)] = 'ˌ{0}'.format(ipa)
+			self.to_ipa['{0}1'.format(arpabet)] = u'ˈ{0}'.format(ipa)
+			self.to_ipa['{0}2'.format(arpabet)] = u'ˌ{0}'.format(ipa)
 		elif data['Type'] == 'schwa':
 			self.to_ipa[arpabet] = ipa # missing stress
 			self.to_ipa['{0}0'.format(arpabet)] = ipa
@@ -102,17 +80,21 @@ class IpaPhonemeSet:
 	def parse(self, phonemes, checks):
 		raise Exception('parse is not currently supported for IPA phonemes')
 
+	def to_local_phonemes(self, phonemes):
+		for phoneme in phonemes:
+			if phoneme in self.to_ipa.keys():
+				yield self.to_ipa[phoneme]
+
 	def format(self, phonemes):
-		return ''.join([self.to_ipa[p] for p in phonemes])
+		return ''.join(self.to_local_phonemes(phonemes))
 
 class ArpabetPhonemeSet:
 	def __init__(self, capitalization):
+		self.re_phonemes = re.compile(r' (?=[^ ])')
 		if capitalization == 'upper':
-			self.re_phonemes = re.compile(r' (?=[A-Z][A-Z]?[0-9]?)')
 			self.conversion = ustr.upper
 			self.parse_phoneme = ustr # already upper case
 		elif capitalization == 'lower':
-			self.re_phonemes = re.compile(r' (?=[a-z][a-z]?[0-9]?)')
 			self.conversion = ustr.lower
 			self.parse_phoneme = ustr.upper
 		else:
@@ -154,10 +136,17 @@ class ArpabetPhonemeSet:
 				if 'missing-stress' in checks:
 					yield None, 'Vowel phoneme "{0}" missing stress marker'.format(phoneme)
 			elif not phoneme in self.to_arpabet.keys():
+				newphoneme = self.conversion(phoneme)
 				if 'invalid-phonemes' in checks:
-					yield None, 'Invalid phoneme "{0}"'.format(phoneme)
-					yield ustr(phoneme).upper(), None
-					continue
+					if newphoneme in self.missing_stress_marks:
+						if 'missing-stress' in checks:
+							yield None, 'Vowel phoneme "{0}" missing stress marker'.format(phoneme)
+					elif not newphoneme in self.to_arpabet.keys():
+						yield None, 'Invalid phoneme "{0}"'.format(phoneme)
+					else:
+						yield None, 'Incorrect phoneme casing "{0}"'.format(phoneme)
+				yield newphoneme, None
+				continue
 
 			yield self.to_arpabet[phoneme], None
 
@@ -172,76 +161,76 @@ class ArpabetPhonemeSet:
 	def format(self, phonemes):
 		return ' '.join(self.to_local_phonemes(phonemes))
 
-accents = {
-	# general purpose accents
-	'en-GB': lambda: ArpabetPhonemeSet('upper'),
-	'en-GB-x-ipa': lambda: IpaPhonemeSet('en-GB'),
-	'en-US': lambda: ArpabetPhonemeSet('upper'),
-	'en-US-x-ipa': lambda: IpaPhonemeSet('en-US'),
-	# dictionary/TTS specific accents
-	'en-GB-x-cepstral': lambda: ArpabetPhonemeSet('lower'),
-	'en-US-x-cepstral': lambda: ArpabetPhonemeSet('lower'),
-	'en-US-x-cmu': lambda: ArpabetPhonemeSet('upper'),
-	'en-US-x-festvox': lambda: ArpabetPhonemeSet('lower'),
+phonesets = {
+	'arpabet':  lambda: ArpabetPhonemeSet('upper'),
+	'cepstral': lambda: ArpabetPhonemeSet('lower'),
+	'cmu':      lambda: ArpabetPhonemeSet('upper'),
+	'festvox':  lambda: ArpabetPhonemeSet('lower'),
+	'ipa':      lambda: IpaPhonemeSet('IPA'),
+	'timit':    lambda: ArpabetPhonemeSet('lower'),
 }
 
-phoneme_table = list(read_phonetable(os.path.join(root, 'phones.csv')))
-
-def load_phonemes(accent):
-	phonemeset = accents[accent]()
-	for p in phoneme_table:
-		if accent in p['Accents'] or accent.endswith('-ipa'):
-			phonemeset.add(p)
-	return phonemeset
+def load_phonemes(accent, phoneset):
+	phones = phonesets[phoneset]()
+	if not accent.endswith('.csv'):
+		accent = os.path.join(root, 'accents', '{0}.csv'.format(accent))
+	for p in read_phonetable(accent):
+		if phoneset in p['Phone Sets']:
+			phones.add(p)
+	return phones
 
 dict_formats = { # {0} = word ; {1} = context ; {2} = phonemes ; {3} = comment
 	'cmudict-weide': {
-		'accent': 'en-US-x-cmu',
+		'accent': 'en-US',
+		'phoneset': 'cmu',
 		# formatting:
-		'comment': '##{3}',
-		'entry': '{0}  {2}',
-		'entry-comment': '{0}  {2} #{3}',
-		'entry-context': '{0}({1})  {2}',
-		'entry-context-comment': '{0}({1})  {2} #{3}',
+		'comment': '##{3}\n',
+		'entry': '{0}  {2}\n',
+		'entry-comment': '{0}  {2} #{3}\n',
+		'entry-context': '{0}({1})  {2}\n',
+		'entry-context-comment': '{0}({1})  {2} #{3}\n',
 		'word': lambda word: word.upper(),
 		# parsing:
 		'word-validation': r'^[^ a-zA-Z]?[A-Z0-9\'\.\-\_\x80-\xFF]*$',
 		'context-parser': int,
 	},
 	'cmudict': {
-		'accent': 'en-US-x-cmu',
+		'accent': 'en-US',
+		'phoneset': 'cmu',
 		# formatting:
-		'comment': ';;;{3}',
-		'entry': '{0}  {2}',
-		'entry-comment': '{0}  {2} #{3}',
-		'entry-context': '{0}({1})  {2}',
-		'entry-context-comment': '{0}({1})  {2} #{3}',
+		'comment': ';;;{3}\n',
+		'entry': '{0}  {2}\n',
+		'entry-comment': '{0}  {2} #{3}\n',
+		'entry-context': '{0}({1})  {2}\n',
+		'entry-context-comment': '{0}({1})  {2} #{3}\n',
 		'word': lambda word: word.upper(),
 		# parsing:
 		'word-validation': r'^[^ a-zA-Z]?[A-Z0-9\'\.\-\_\x80-\xFF]*$',
 		'context-parser': int,
 	},
 	'cmudict-new': {
-		'accent': 'en-US-x-cmu',
+		'accent': 'en-US',
+		'phoneset': 'cmu',
 		# formatting:
-		'comment': ';;;{3}',
-		'entry': '{0} {2}',
-		'entry-context': '{0}({1}) {2}',
-		'entry-comment': '{0} {2} #{3}',
-		'entry-context-comment': '{0}({1}) {2} #{3}',
+		'comment': ';;;{3}\n',
+		'entry': '{0} {2}\n',
+		'entry-context': '{0}({1}) {2}\n',
+		'entry-comment': '{0} {2} #{3}\n',
+		'entry-context-comment': '{0}({1}) {2} #{3}\n',
 		'word': lambda word: word.lower(),
 		# parsing:
 		'word-validation': r'^[^ a-zA-Z]?[a-z0-9\'\.\-\_\x80-\xFF]*$',
 		'context-parser': int,
 	},
 	'festlex': {
-		'accent': 'en-US-x-festvox',
+		'accent': 'en-US',
+		'phoneset': 'festvox',
 		# formatting:
-		'comment': ';;{3}',
-		'entry': '("{0}" nil ({2}))',
-		'entry-context': '("{0}" {1} ({2}))',
-		'entry-comment': '("{0}" nil ({2})) ;{3}',
-		'entry-context-comment': '("{0}" {1} ({2})) ;{3}',
+		'comment': ';;{3}\n',
+		'entry': '("{0}" nil ({2}))\n',
+		'entry-context': '("{0}" {1} ({2}))\n',
+		'entry-comment': '("{0}" nil ({2})) ;{3}\n',
+		'entry-context-comment': '("{0}" {1} ({2})) ;{3}\n',
 		'word': lambda word: word.lower(),
 		# parsing:
 		'word-validation': r'^[^ a-zA-Z]?[a-z0-9\'\.\-\_\x80-\xFF]*$',
@@ -311,9 +300,9 @@ def sort(entries, mode):
 			yield entry
 	elif mode in ['weide', 'air']:
 		ordered = []
-		for word, context, phonemes, comment, error in entries:
+		for word, context, phonemes, comment, metadata, error in entries:
 			if not word:
-				yield (word, context, phonemes, comment, error)
+				yield (word, context, phonemes, comment, metadata, error)
 				continue
 			if mode == 'weide':
 				if context:
@@ -325,18 +314,22 @@ def sort(entries, mode):
 					key = '{0}!{1}'.format(word, context)
 				else:
 					key = word
-			ordered.append((key, (word, context, phonemes, comment, error)))
+			ordered.append((key, (word, context, phonemes, comment, metadata, error)))
 		for key, entry in sorted(ordered):
 			yield entry
 	else:
 		raise ValueError('unsupported sort mode: {0}'.format(mode))
 
-def format(dict_format, entries, accent=None, encoding='windows-1252'):
+def format_text(dict_format, entries, accent=None, phoneset=None, encoding='windows-1252'):
 	fmt = dict_formats[dict_format]
 	if not accent:
 		accent = fmt['accent']
-	phonemeset = load_phonemes(accent)
-	for word, context, phonemes, comment, error in entries:
+	if not phoneset:
+		phoneset = fmt['phoneset']
+	if phoneset == 'ipa':
+		encoding = 'utf-8'
+	phonemeset = load_phonemes(accent, phoneset)
+	for word, context, phonemes, comment, metadata, error in entries:
 		if error:
 			print(error, file=sys.stderr)
 			continue
@@ -347,6 +340,11 @@ def format(dict_format, entries, accent=None, encoding='windows-1252'):
 		if context:
 			components.append('context')
 		if comment != None:
+			if metadata != None:
+				meta = []
+				for key, values in sorted(metadata.items()):
+					meta.extend(['{0}={1}'.format(key, value) for value in values])
+				comment = '@@ {0} @@{1}'.format(' '.join(meta), comment)
 			components.append('comment')
 		if phonemes:
 			phonemes = phonemeset.format(phonemes)
@@ -355,16 +353,41 @@ def format(dict_format, entries, accent=None, encoding='windows-1252'):
 		else:
 			printf(fmt['-'.join(components)], encoding, word, context, phonemes, comment)
 
+def format_json(dict_format, entries, accent=None, phoneset=None, encoding='windows-1252'):
+	fields = ['word', 'context', 'pronunciation', 'comment', 'metadata', 'error-message']
+	need_comma = False
+	printf('[\n', encoding)
+	for entry in entries:
+		data = dict([(k, v) for k, v in zip(fields, entry) if v != None])
+		if need_comma:
+			printf(',\n', encoding)
+		printf('{0}', encoding, json.dumps(data, sort_keys=True))
+		need_comma = True
+	if need_comma:
+		printf('\n]\n', encoding)
+	else:
+		printf(']\n', encoding)
+
+def format(dict_format, entries, accent=None, phoneset=None, encoding='windows-1252'):
+	if dict_format in ['json']:
+		format_json(dict_format, entries, accent, phoneset, encoding)
+	else:
+		format_text(dict_format, entries, accent, phoneset, encoding)
+
 def read_file(filename, encoding='windows-1252'):
 	with codecs.open(filename, encoding=encoding) as f:
 		for line in f:
 			yield line.replace('\n', '')
 
+class InvalidWarning(ValueError):
+	def __init__(self, message):
+		ValueError.__init__(self, message)
+
 def warnings_to_checks(warnings):
 	checks = default_warnings
 	for warning in warnings:
 		if warning == 'all':
-			checks = parser_warnings.keys()
+			checks = list(parser_warnings.keys())
 		elif warning == 'none':
 			checks = []
 		elif warning.startswith('no-'):
@@ -372,13 +395,39 @@ def warnings_to_checks(warnings):
 				if warning[3:] in checks:
 					checks.remove(warning[3:])
 			else:
-				raise ValueError('Invalid warning: {0}'.format(warning))
+				raise InvalidWarning('Invalid warning: {0}'.format(warning))
 		elif warning in parser_warnings.keys():
 			if warning not in checks:
 				checks.append(warning)
 		else:
-			raise ValueError('Invalid warning: {0}'.format(warning))
+			raise InvalidWarning('Invalid warning: {0}'.format(warning))
 	return checks
+
+def parse_comment_string(comment, values=None):
+	metadata = None
+	errors = []
+	re_key   = re.compile(r'^[a-zA-Z0-9_\-]+$')
+	re_value = re.compile(r'^[^\x00-\x20\x7F-\xFF"]+$')
+	if comment.startswith('@@'):
+		_, metastring, comment = comment.split('@@')
+		metadata = {}
+		for key, value in [x.split('=') for x in metastring.strip().split()]:
+			if values:
+				if not key in values.keys():
+					errors.append('Invalid metadata key "{0}"'.format(key))
+				elif not value in values[key]:
+					errors.append('Invalid metadata value "{0}"'.format(value))
+			else:
+				if not re_key.match(key):
+					errors.append('Invalid metadata key "{0}"'.format(key))
+				if not re_value.match(value):
+					errors.append('Invalid metadata value "{0}"'.format(value))
+
+			if key in metadata.keys():
+				metadata[key].append(value)
+			else:
+				metadata[key] = [value]
+	return comment, metadata, errors
 
 def parse_festlex(filename, checks, order_from, encoding):
 	"""
@@ -389,32 +438,40 @@ def parse_festlex(filename, checks, order_from, encoding):
 	"""
 
 	re_linecomment = re.compile(r'^;;(.*)$')
-	re_entry = re.compile(r'^\("([^"]+)" ([a-zA-Z0-9_]+) \(([^\)]+)\)\)[ \t]*(;(.*))?[ \t]*$')
+	re_entry = re.compile(r'^\("([^"]+)" ([a-zA-Z0-9_]+) \(([^\)]+)\)[ \t]*\)[ \t]*(;(.*))?[ \t]*$')
 	format = 'festlex'
 	for line in read_file(filename, encoding=encoding):
 		if line == '':
-			yield line, format, None, None, None, None, None
+			yield line, format, None, None, None, None, None, None
 			continue
 
 		m = re_linecomment.match(line)
 		if m:
-			yield line, format, None, None, None, m.group(1), None
+			comment, meta, errors = parse_comment_string(m.group(1))
+			for message in errors:
+				yield line, format, None, None, None, None, None, '{0} in entry: "{1}"'.format(message, line)
+			yield line, format, None, None, None, comment, meta, None
 			continue
 
 		m = re_entry.match(line)
 		if not m:
-			yield line, format, None, None, None, None, 'Unsupported entry: "{0}"'.format(line)
+			yield line, format, None, None, None, None, None, 'Unsupported entry: "{0}"'.format(line)
 			continue
 
 		word = m.group(1)
 		context = m.group(2)
 		phonemes = m.group(3)
 		comment = m.group(5)
+		meta = None
+		if comment:
+			comment, meta, errors = parse_comment_string(comment)
+			for message in errors:
+				yield line, format, None, None, None, None, None, '{0} in entry: "{1}"'.format(message, line)
 
 		if context == 'nil':
 			context = None
 
-		yield line, format, word, context, phonemes, comment, None
+		yield line, format, word, context, phonemes, comment, meta, None
 
 def parse_cmudict(filename, checks, order_from, encoding):
 	"""
@@ -423,22 +480,57 @@ def parse_cmudict(filename, checks, order_from, encoding):
 		The return value is of the form:
 			(line, format, word, context, phonemes, comment, error)
 	"""
-	re_linecomment = re.compile(r'^(##|;;;)(.*)$')
+	re_linecomment_weide = re.compile(r'^##(.*)$')
+	re_linecomment_air   = re.compile(r'^;;;(.*)$')
 	re_entry = re.compile(r'^([^ a-zA-Z\x80-\xFF]?[a-zA-Z0-9\'\.\-\_\x80-\xFF]*)(\(([^\)]*)\))?([ \t]+)([^#]+)( #(.*))?[ \t]*$')
 	format = None
+	entry_metadata = None
 	for line in read_file(filename, encoding=encoding):
 		if line == '':
-			yield line, format, None, None, None, None, None
+			yield line, format, None, None, None, None, None, None
 			continue
 
-		m = re_linecomment.match(line)
+		comment = None
+		m = re_linecomment_weide.match(line)
 		if m:
-			yield line, format, None, None, None, m.group(2), None
+			comment, meta, errors = parse_comment_string(m.group(1))
+			comment_format = 'cmudict-weide'
+
+		m = re_linecomment_air.match(line)
+		if m:
+			comment, meta, errors = parse_comment_string(m.group(1))
+			comment_format = 'cmudict-air'
+
+		if comment is not None:
+			for message in errors:
+				yield line, format, None, None, None, None, None, '{0} in entry: "{1}"'.format(message, line)
+			if meta:
+				if 'format' in meta.keys():
+					format = meta['format'][0]
+					if format == 'cmudict-new':
+						spacing = ' '
+					else:
+						spacing = '  '
+				if 'metadata' in meta.keys():
+					if not entry_metadata:
+						entry_metadata = {}
+					entry_metadata.update(metadata.parse(meta['metadata'][0]))
+			if not format: # detect the dictionary format ...
+				format = comment_format
+				if format == 'cmudict-new':
+					spacing = ' '
+				else:
+					spacing = '  '
+			if format != 'cmudict-weide' and comment_format == 'cmudict-weide':
+				yield line, format, None, None, None, None, None, u'Old-style comment: "{0}"'.format(line)
+			elif format == 'cmudict-weide' and comment_format == 'cmudict-air':
+				yield line, format, None, None, None, None, None, u'New-style comment: "{0}"'.format(line)
+			yield line, format, None, None, None, comment, meta, None
 			continue
 
 		m = re_entry.match(line)
 		if not m:
-			yield line, format, None, None, None, None, u'Unsupported entry: "{0}"'.format(line)
+			yield line, format, None, None, None, None, None, u'Unsupported entry: "{0}"'.format(line)
 			continue
 
 		word = m.group(1)
@@ -446,8 +538,13 @@ def parse_cmudict(filename, checks, order_from, encoding):
 		word_phoneme_space = m.group(4)
 		phonemes = m.group(5)
 		comment = m.group(7) or None # 6 = with comment marker: `#...`
+		meta = None
+		if comment:
+			comment, meta, errors = parse_comment_string(comment, values=entry_metadata)
+			for message in errors:
+				yield line, format, None, None, None, None, None, '{0} in entry: "{1}"'.format(message, line)
 
-		if not format: # detect the dictionary format ...
+		if not format or format == 'cmudict-air': # detect the dictionary format ...
 			cmudict_fmt = re.compile(dict_formats['cmudict']['word-validation'])
 			if cmudict_fmt.match(word):
 				format = 'cmudict'
@@ -457,14 +554,14 @@ def parse_cmudict(filename, checks, order_from, encoding):
 				spacing = ' '
 
 		if word_phoneme_space != spacing and 'entry-spacing' in checks:
-			yield line, format, None, None, None, None, u'Entry needs {0} spaces between word and phoneme: "{1}"'.format(len(spacing), line)
+			yield line, format, None, None, None, None, None, u'Entry needs {0} spaces between word and phoneme: "{1}"'.format(len(spacing), line)
 
 		if phonemes.endswith(' ') and 'trailing-whitespace' in checks:
-			yield line, format, None, None, None, None, u'Trailing whitespace in entry: "{0}"'.format(line)
+			yield line, format, None, None, None, None, None, u'Trailing whitespace in entry: "{0}"'.format(line)
 
-		yield line, format, word, context, phonemes, comment, None
+		yield line, format, word, context, phonemes, comment, meta, None
 
-def parse(filename, warnings=[], order_from=0, accent=None, encoding='windows-1252'):
+def parse(filename, warnings=[], order_from=0, accent=None, phoneset=None, encoding='windows-1252'):
 	checks = warnings_to_checks(warnings)
 	previous_word = None
 	re_word = None
@@ -479,29 +576,31 @@ def parse(filename, warnings=[], order_from=0, accent=None, encoding='windows-12
 	else:
 		dict_parser = parse_cmudict
 
-	for line, format, word, context, phonemes, comment, error in dict_parser(filename, checks, order_from, encoding):
+	for line, format, word, context, phonemes, comment, meta, error in dict_parser(filename, checks, order_from, encoding):
 		if error:
-			yield None, None, None, None, error
+			yield None, None, None, None, None, error
 			continue
 
 		if not word: # line comment or blank line
-			yield None, None, None, comment, None
+			yield None, None, None, comment, meta, None
 			continue
 
 		if not fmt:
 			fmt = dict_formats[format]
 			if not accent:
 				accent = fmt['accent']
-			phonemeset = load_phonemes(accent)
+			if not phoneset:
+				phoneset = fmt['phoneset']
+			phonemeset = load_phonemes(accent, phoneset)
 			context_parser = fmt['context-parser']
 
 		# word validation checks
 
 		if fmt['word'](word) != word and 'word-casing' in checks:
-			yield None, None, None, None, u'Incorrect word casing in entry: "{0}"'.format(line)
+			yield None, None, None, None, None, u'Incorrect word casing in entry: "{0}"'.format(line)
 
 		if previous_word and word < previous_word and 'unsorted' in checks:
-			yield None, None, None, None, u'Incorrect word ordering ("{0}" < "{1}") for entry: "{2}"'.format(word, previous_word, line)
+			yield None, None, None, None, None, u'Incorrect word ordering ("{0}" < "{1}") for entry: "{2}"'.format(word, previous_word, line)
 
 		# context parsing and validation checks
 
@@ -510,14 +609,14 @@ def parse(filename, warnings=[], order_from=0, accent=None, encoding='windows-12
 				context = context_parser(context)
 		except ValueError:
 			if 'context-values' in checks:
-				yield None, None, None, None, u'Invalid context format "{0}" in entry: "{1}"'.format(context, line)
+				yield None, None, None, None, None, u'Invalid context format "{0}" in entry: "{1}"'.format(context, line)
 
 		# phoneme validation checks
 
 		arpabet_phonemes = []
 		for phoneme, error in phonemeset.parse(phonemes, checks):
 			if error:
-				yield None, None, None, None, u'{0} in entry: "{1}"'.format(error, line)
+				yield None, None, None, None, None, u'{0} in entry: "{1}"'.format(error, line)
 			else:
 				arpabet_phonemes.append(phoneme)
 
@@ -528,7 +627,7 @@ def parse(filename, warnings=[], order_from=0, accent=None, encoding='windows-12
 
 		entry_line = u'{0}({1}) {2}'.format(word, context, arpabet_phonemes)
 		if entry_line in lines and 'duplicate-entries' in checks:
-			yield None, None, None, None, u'Duplicate entry: "{2}"'.format(position, expect_position, line)
+			yield None, None, None, None, None, u'Duplicate entry: "{2}"'.format(position, expect_position, line)
 		elif isinstance(position, int):
 			pronunciation = ' '.join(arpabet_phonemes)
 			if key in entries:
@@ -537,11 +636,11 @@ def parse(filename, warnings=[], order_from=0, accent=None, encoding='windows-12
 				expect_position = order_from
 				pronunciations = []
 			if position != expect_position and 'context-ordering' in checks:
-				yield None, None, None, None, u'Incorrect context ordering "{0}" (expected: "{1}") in entry: "{2}"'.format(position, expect_position, line)
+				yield None, None, None, None, None, u'Incorrect context ordering "{0}" (expected: "{1}") in entry: "{2}"'.format(position, expect_position, line)
 			expect_position = expect_position + 1
 			if pronunciation in pronunciations:
 				if 'duplicate-pronunciations' in checks:
-					yield None, None, None, None, u'Existing pronunciation in entry: "{2}"'.format(position, expect_position, line)
+					yield None, None, None, None, None, u'Existing pronunciation in entry: "{2}"'.format(position, expect_position, line)
 			else:
 				pronunciations.append(pronunciation)
 			entries[key] = (expect_position, pronunciations)
@@ -551,4 +650,4 @@ def parse(filename, warnings=[], order_from=0, accent=None, encoding='windows-12
 
 		# return the parsed entry
 
-		yield word, context, arpabet_phonemes, comment, None
+		yield word, context, arpabet_phonemes, comment, meta, None
